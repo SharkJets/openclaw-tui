@@ -27,7 +27,7 @@ A beautiful terminal dashboard for monitoring [OpenClaw](https://openclaw.dev) A
 
 ```bash
 # Clone the repo
-git clone https://github.com/YOUR_USERNAME/openclaw-tui.git
+git clone https://github.com/SharkJets/openclaw-tui.git
 cd openclaw-tui
 
 # Install dependencies
@@ -42,7 +42,7 @@ python dashboard.py
 ### Option 1: Virtual Environment (Recommended)
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/openclaw-tui.git
+git clone https://github.com/SharkJets/openclaw-tui.git
 cd openclaw-tui
 
 python -m venv .venv
@@ -62,7 +62,7 @@ python dashboard.py
 ### Option 3: One-liner
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/YOUR_USERNAME/openclaw-tui/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/SharkJets/openclaw-tui/main/install.sh | bash
 ```
 
 ## Configuration
