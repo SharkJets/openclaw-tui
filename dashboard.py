@@ -76,6 +76,7 @@ cached_usage = {"data": {}, "time": 0}
 cached_costs = {"data": {}, "time": 0}
 cached_crons = {"data": [], "time": 0}
 cached_messages = {"data": [], "time": 0}
+cached_skills = {"data": [], "time": 0}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -376,6 +377,60 @@ def get_crons():
     return cached_crons["data"]
 
 
+def get_skills():
+    now = time.time()
+    if now - cached_skills["time"] < SLOW_INTERVAL:
+        return cached_skills["data"]
+    
+    try:
+        skills = []
+        
+        # Check workspace skills directory
+        workspace_skills = WORKSPACE_DIR / 'skills'
+        if workspace_skills.exists():
+            for skill_dir in workspace_skills.iterdir():
+                if skill_dir.is_dir():
+                    skill_file = skill_dir / 'SKILL.md'
+                    if skill_file.exists():
+                        skills.append({
+                            'name': skill_dir.name,
+                            'source': 'workspace',
+                        })
+        
+        # Check ~/.openclaw/skills
+        openclaw_skills = OPENCLAW_DIR / 'skills'
+        if openclaw_skills.exists():
+            for skill_dir in openclaw_skills.iterdir():
+                if skill_dir.is_dir():
+                    skill_file = skill_dir / 'SKILL.md'
+                    if skill_file.exists():
+                        skills.append({
+                            'name': skill_dir.name,
+                            'source': 'openclaw',
+                        })
+        
+        # Check bundled skills (npm global)
+        npm_skills = HOME / '.npm-global' / 'lib' / 'node_modules' / 'openclaw' / 'skills'
+        if npm_skills.exists():
+            for skill_dir in npm_skills.iterdir():
+                if skill_dir.is_dir():
+                    skill_file = skill_dir / 'SKILL.md'
+                    if skill_file.exists():
+                        # Don't duplicate if already found
+                        if not any(s['name'] == skill_dir.name for s in skills):
+                            skills.append({
+                                'name': skill_dir.name,
+                                'source': 'bundled',
+                            })
+        
+        skills.sort(key=lambda x: x['name'])
+        cached_skills["data"] = skills
+        cached_skills["time"] = now
+    except:
+        pass
+    return cached_skills["data"]
+
+
 def get_messages():
     now = time.time()
     if now - cached_messages["time"] < MEDIUM_INTERVAL:
@@ -653,6 +708,42 @@ def make_feed() -> Panel:
     return Panel("\n".join(lines), title="Live Feed", border_style="red")
 
 
+def make_skills() -> Panel:
+    skills = get_skills()
+    lines = []
+    
+    # Group by source
+    workspace = [s for s in skills if s['source'] == 'workspace']
+    openclaw = [s for s in skills if s['source'] == 'openclaw']
+    bundled = [s for s in skills if s['source'] == 'bundled']
+    
+    if workspace:
+        lines.append("[yellow]workspace[/]")
+        for s in workspace:
+            lines.append(f"  [green]●[/] {s['name']}")
+    
+    if openclaw:
+        if lines:
+            lines.append("")
+        lines.append("[cyan]~/.openclaw[/]")
+        for s in openclaw:
+            lines.append(f"  [green]●[/] {s['name']}")
+    
+    if bundled:
+        if lines:
+            lines.append("")
+        lines.append("[dim]bundled[/]")
+        for s in bundled[:6]:  # Limit bundled to 6
+            lines.append(f"  [dim]●[/] {s['name']}")
+        if len(bundled) > 6:
+            lines.append(f"  [dim]... +{len(bundled) - 6} more[/]")
+    
+    if not skills:
+        lines.append("  No skills loaded")
+    
+    return Panel("\n".join(lines), title=f"Skills ({len(skills)})", border_style="magenta")
+
+
 def make_layout() -> Layout:
     layout = Layout()
     
@@ -677,9 +768,9 @@ def make_layout() -> Layout:
         Layout(make_processes(), name="processes"),
     )
     
-    # Row 2: Empty | Live Feed (2 cols)
+    # Row 2: Skills | Live Feed (2 cols)
     layout["row2"].split_row(
-        Layout(Panel("", border_style="dim"), ratio=1),
+        Layout(make_skills(), name="skills", ratio=1),
         Layout(make_feed(), name="feed", ratio=2),
     )
     
