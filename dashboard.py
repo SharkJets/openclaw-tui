@@ -185,16 +185,44 @@ def get_sessions():
         if sess_file.exists():
             data = json.loads(sess_file.read_text())
             sessions = []
+            seen_labels = set()
+            
             for key, s in data.items():
-                label = 'main' if ':main:main' in key else s.get('label', key.split(':')[-1][:12])
+                # Determine label
+                if ':main:main' in key:
+                    label = 'main'
+                elif 'cron:' in key:
+                    label = s.get('label', s.get('name', 'cron'))
+                    # Clean up cron labels
+                    if label.startswith('Cron: '):
+                        label = label[6:]
+                elif 'subagent' in key:
+                    label = s.get('label', 'subagent')
+                else:
+                    label = s.get('label', key.split(':')[-1])
+                
+                # Truncate and clean label
+                label = label[:28]
+                
+                # Skip duplicates (keep most recent)
+                if label in seen_labels:
+                    continue
+                seen_labels.add(label)
+                
+                # Clean model name
+                model = (s.get('model') or '-').split('/')[-1]
+                # Shorten common model names
+                model = model.replace('claude-', '').replace('-20250', '')[:10]
+                
                 sessions.append({
                     'label': label,
-                    'model': (s.get('model') or '-').split('/')[-1][:12],
+                    'model': model,
                     'tokens': s.get('totalTokens', 0),
                     'updated': s.get('updatedAt', 0),
                 })
+            
             sessions.sort(key=lambda x: x['updated'], reverse=True)
-            cached_sessions["data"] = sessions[:8]
+            cached_sessions["data"] = sessions[:10]
             cached_sessions["time"] = now
     except:
         pass
@@ -508,10 +536,23 @@ def make_sessions() -> Panel:
     sessions = get_sessions()
     lines = []
     
+    # Header
+    lines.append("[dim]SESSION                      MODEL      TOKENS  AGO[/]")
+    lines.append("")
+    
     for s in sessions:
         ago = format_ago(s['updated'])
-        style = "green" if 'now' in ago or 'm' in ago else ("yellow" if 'h' in ago else "dim")
-        lines.append(f"[{style}]{s['label']:<12} {s['model']:<10} {format_tokens(s['tokens']):>6} {ago:>4}[/]")
+        tokens = format_tokens(s['tokens'])
+        
+        # Color based on recency
+        if ago == 'now' or 'm' in ago:
+            style = "green"
+        elif 'h' in ago and int(ago.replace('h', '')) < 6:
+            style = "yellow"
+        else:
+            style = "dim"
+        
+        lines.append(f"[{style}]{s['label']:<28} {s['model']:<10} {tokens:>6}  {ago:>4}[/]")
     
     if not sessions:
         lines.append("  No sessions")
@@ -616,26 +657,36 @@ def make_layout() -> Layout:
     layout = Layout()
     
     layout.split_column(
-        Layout(name="top", size=14),
-        Layout(name="middle", size=12),
-        Layout(name="bottom", size=12),
+        Layout(name="row0", size=14),
+        Layout(name="row1", size=12),
+        Layout(name="row2", size=10),
+        Layout(name="row3", size=10),
     )
     
-    layout["top"].split_row(
+    # Row 0: Overview | Usage | Costs
+    layout["row0"].split_row(
         Layout(make_overview(), name="overview"),
         Layout(make_usage(), name="usage"),
         Layout(make_costs(), name="costs"),
     )
     
-    layout["middle"].split_row(
-        Layout(make_sessions(), name="sessions"),
+    # Row 1: Network | Crons | Processes
+    layout["row1"].split_row(
+        Layout(make_network(), name="network"),
         Layout(make_crons(), name="crons"),
         Layout(make_processes(), name="processes"),
     )
     
-    layout["bottom"].split_row(
-        Layout(make_network(), name="network", ratio=1),
+    # Row 2: Empty | Live Feed (2 cols)
+    layout["row2"].split_row(
+        Layout(Panel("", border_style="dim"), ratio=1),
         Layout(make_feed(), name="feed", ratio=2),
+    )
+    
+    # Row 3: Empty | Sessions (2 cols)
+    layout["row3"].split_row(
+        Layout(Panel("", border_style="dim"), ratio=1),
+        Layout(make_sessions(), name="sessions", ratio=2),
     )
     
     return layout
