@@ -413,8 +413,8 @@ def get_messages():
                 except:
                     continue
         
-        messages.sort(key=lambda x: x['ts'], reverse=True)
-        cached_messages["data"] = messages[:8]
+        messages.sort(key=lambda x: x['ts'])  # Oldest first, newest at bottom
+        cached_messages["data"] = messages[-8:]  # Keep last 8
         cached_messages["time"] = now
     except:
         pass
