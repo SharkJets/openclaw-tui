@@ -1,0 +1,3 @@
+#!/bin/bash
+# Wrapper for openclaw-tui
+exec "$(dirname "$0")/run.sh" "$@"
