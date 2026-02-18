@@ -1,6 +1,6 @@
 # OpenClaw TUI Dashboard
 
-A beautiful terminal dashboard for monitoring [OpenClaw](https://openclaw.dev) AI agents in real-time.
+A lightweight terminal dashboard for monitoring [OpenClaw](https://openclaw.dev) AI agents in real-time.
 
 ![Dashboard Screenshot](docs/screenshot.png)
 
@@ -17,6 +17,13 @@ A beautiful terminal dashboard for monitoring [OpenClaw](https://openclaw.dev) A
 - 🔝 **Top Processes** — CPU/memory usage by process
 - 🌐 **Network** — Upload/download with traffic sparklines
 
+## Why This Dashboard?
+
+- **~1% CPU** — Uses Rich's simple Live display instead of reactive frameworks
+- **Minimal deps** — Just `rich` and `psutil`
+- **TTY compatible** — Auto-detects Linux console and uses ASCII sparklines
+- **Cached data** — Expensive operations only run every 10-30s
+
 ## Requirements
 
 - Python 3.10+
@@ -27,7 +34,7 @@ A beautiful terminal dashboard for monitoring [OpenClaw](https://openclaw.dev) A
 
 ```bash
 # Clone the repo
-git clone https://github.com/YOUR_USERNAME/openclaw-tui.git
+git clone https://github.com/SkidVis/openclaw-tui.git
 cd openclaw-tui
 
 # Install dependencies
@@ -42,7 +49,7 @@ python dashboard.py
 ### Option 1: Virtual Environment (Recommended)
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/openclaw-tui.git
+git clone https://github.com/SkidVis/openclaw-tui.git
 cd openclaw-tui
 
 python -m venv .venv
@@ -55,14 +62,8 @@ pip install -r requirements.txt
 ### Option 2: System Install
 
 ```bash
-pip install textual psutil rich pynvml
+pip install rich psutil pynvml
 python dashboard.py
-```
-
-### Option 3: One-liner
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/YOUR_USERNAME/openclaw-tui/main/install.sh | bash
 ```
 
 ## Configuration
@@ -107,21 +108,18 @@ EOF
 
 | Key | Action |
 |-----|--------|
-| `q` | Quit |
-| `r` | Force refresh all panels |
+| `Ctrl+C` | Quit |
 
 ## Terminal Compatibility
 
-- **Graphical terminals** (xterm, GNOME Terminal, iTerm2, etc.): Full Unicode sparklines
-- **Linux TTY**: ASCII-safe sparklines (auto-detected)
-
-For best results on Linux TTY, install [fbterm](https://github.com/nicm/fbterm) for TrueType font support.
+- **Graphical terminals** (xterm, GNOME Terminal, iTerm2, etc.): Full Unicode sparklines (▁▂▃▄▅▆▇█)
+- **Linux TTY**: ASCII-safe sparklines (_.oO08@#) — auto-detected
 
 ## Layout
 
 ```
 ┌─────────────┬─────────────┬─────────────┐
-│   Overview  │    Usage    │    Costs    │
+│   Overview  │  Usage (5h) │    Costs    │
 ├─────────────┼─────────────┼─────────────┤
 │  Sessions   │    Crons    │  Processes  │
 ├─────────────┼─────────────────────────────┤
@@ -131,12 +129,13 @@ For best results on Linux TTY, install [fbterm](https://github.com/nicm/fbterm) 
 
 ## Refresh Rates
 
-| Panel | Interval |
-|-------|----------|
-| Overview, Usage, Costs, Network, Processes | 2s |
-| Live Feed | 5s |
-| Sessions | 10s |
-| Crons | 30s |
+| Data | Interval |
+|------|----------|
+| CPU, RAM, Network | 2s |
+| Sessions, Processes, Live Feed | 10s |
+| Usage, Costs, Crons, Health | 30s |
+
+Data is cached to minimize file I/O and subprocess calls.
 
 ## License
 
@@ -145,7 +144,7 @@ MIT License — see [LICENSE](LICENSE) for details.
 ## Credits
 
 - Built for [OpenClaw](https://openclaw.dev)
-- Uses [Textual](https://textual.textualize.io/) for the TUI framework
+- Uses [Rich](https://rich.readthedocs.io/) for terminal rendering
 - Inspired by [openclaw-dashboard](https://github.com/tugcantopaloglu/openclaw-dashboard)
 
 ## Contributing

@@ -2,31 +2,36 @@
 """
 OpenClaw TUI Dashboard
 Real-time terminal monitoring for OpenClaw agents.
+Uses Rich for rendering with minimal CPU overhead (~1%).
 
 Features:
-- System health (CPU, RAM, Disk, GPU)
+- System health (CPU, RAM, Disk, GPU with sparklines)
 - OpenClaw status and channels
-- Session tracking with token counts
-- 5-hour usage window and rate limits
+- 5-hour usage window with rate limits
 - Cost tracking by model and day
-- Live message feed
+- Session tracking
 - Cron job status
+- Live message feed
 - Top processes
-- Network traffic with sparkline graphs
+- Network traffic with sparklines
 """
 
 import json
 import os
+import signal
 import subprocess
+import sys
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import psutil
-from textual.app import App, ComposeResult
-from textual.widgets import Header, Footer, Static
-from rich.text import Text
+from rich.console import Console
+from rich.layout import Layout
+from rich.live import Live
 from rich.panel import Panel
-from rich.console import Group
+from rich.table import Table
+from rich.text import Text
 
 try:
     import pynvml
@@ -46,26 +51,36 @@ AGENT_ID = os.environ.get('OPENCLAW_AGENT', 'main')
 SESS_DIR = OPENCLAW_DIR / 'agents' / AGENT_ID / 'sessions'
 CRON_FILE = OPENCLAW_DIR / 'cron' / 'jobs.json'
 
-# ASCII sparklines for bare Linux TTY, Unicode for graphical terminals
+# Refresh intervals (seconds)
+FAST_INTERVAL = 2      # CPU, RAM, Network
+MEDIUM_INTERVAL = 10   # Sessions, processes
+SLOW_INTERVAL = 30     # Costs, usage, crons, health
+
+# ASCII mode for Linux TTY (auto-detected)
 _term = os.environ.get('TERM', '').lower()
-ASCII_SPARKLINES = (_term == 'linux')
+ASCII_MODE = (_term == 'linux')
+
+# State
+console = Console()
+last_net = {"sent": 0, "recv": 0, "time": 0}
+cpu_history = []
+ram_history = []
+upload_history = []
+download_history = []
+MAX_HISTORY = 30
+
+# Cached data (to avoid re-reading every loop)
+cached_health = {"data": None, "time": 0}
+cached_sessions = {"data": [], "time": 0}
+cached_usage = {"data": {}, "time": 0}
+cached_costs = {"data": {}, "time": 0}
+cached_crons = {"data": [], "time": 0}
+cached_messages = {"data": [], "time": 0}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Utilities
 # ─────────────────────────────────────────────────────────────────────────────
-
-def run_cmd(cmd: list[str], timeout: int = 5) -> tuple[bool, str]:
-    try:
-        env = os.environ.copy()
-        npm_bin = os.path.expanduser("~/.npm-global/bin")
-        if npm_bin not in env.get("PATH", ""):
-            env["PATH"] = f"{npm_bin}:{env.get('PATH', '')}"
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
-        return result.returncode == 0, result.stdout + result.stderr
-    except:
-        return False, ""
-
 
 def format_bytes(b: float) -> str:
     for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
@@ -84,793 +99,564 @@ def format_tokens(t: int) -> str:
 
 
 def format_cost(c: float) -> str:
-    if c >= 1:
-        return f"${c:.2f}"
-    return f"${c:.3f}"
+    return f"${c:.2f}" if c >= 1 else f"${c:.3f}"
 
 
 def format_ago(ts_ms: int) -> str:
     if not ts_ms:
         return "never"
-    now = datetime.now().timestamp() * 1000
-    diff_sec = (now - ts_ms) / 1000
+    diff_sec = (time.time() * 1000 - ts_ms) / 1000
     if diff_sec < 60:
-        return "just now"
+        return "now"
     if diff_sec < 3600:
-        return f"{int(diff_sec/60)}m ago"
+        return f"{int(diff_sec/60)}m"
     if diff_sec < 86400:
-        return f"{int(diff_sec/3600)}h ago"
-    return f"{int(diff_sec/86400)}d ago"
+        return f"{int(diff_sec/3600)}h"
+    return f"{int(diff_sec/86400)}d"
 
 
-def get_color(percent: float) -> str:
-    if percent < 50:
+def get_color(pct: float) -> str:
+    if pct < 50:
         return "green"
-    elif percent < 80:
+    if pct < 80:
         return "yellow"
     return "red"
 
 
-def make_bar(percent: float, width: int = 30, label: str = "") -> Text:
-    filled = int(width * min(percent, 100) / 100)
-    empty = width - filled
-    color = get_color(percent)
-    bar = Text()
-    bar.append("█" * filled, style=color)
-    bar.append("░" * empty, style="bright_black")
-    bar.append(f" {percent:.0f}%", style="bold " + color)
-    if label:
-        bar.append(f" {label}", style="dim")
-    return bar
-
-
-def make_sparkline(values: list[float], width: int = 30, color: str = "green", max_cap: float = 100, ascii_mode: bool = False) -> Text:
-    """Create a sparkline from values. Newest on right, scrolls left."""
+def sparkline(values: list[float], width: int = 20, max_val: float = 100) -> str:
     if not values:
-        char = "_" if ascii_mode else "▁"
-        return Text(char * width, style="dim")
+        return "▁" * width if not ASCII_MODE else "_" * width
     
-    # Sparkline characters (8 levels) - Unicode blocks or ASCII fallback
-    if ascii_mode:
-        chars = "_.oO08@#"  # ASCII-safe, all visible
-    else:
-        chars = "▁▂▃▄▅▆▇█"  # Unicode blocks
-    
-    # Take the most recent `width` values
+    chars = "_.oO08@#" if ASCII_MODE else "▁▂▃▄▅▆▇█"
     recent = values[-width:]
     
-    # Normalize using absolute scale
-    normalized = [min(v / max_cap, 1.0) for v in recent]
+    # Pad left
+    if len(recent) < width:
+        recent = [0] * (width - len(recent)) + recent
     
-    # Pad on the LEFT with empty bars if we don't have enough history yet
-    # This makes new values appear on the right and scroll left over time
-    if len(normalized) < width:
-        normalized = [0] * (width - len(normalized)) + normalized
-    
-    result = Text()
-    for v in normalized:
-        idx = min(int(v * 7.99), 7)  # 0-7 index into 8 chars
-        result.append(chars[idx], style=color)
-    
+    result = ""
+    for v in recent:
+        idx = min(int((v / max_val) * 7.99), 7)
+        result += chars[idx]
     return result
 
 
+def bar(pct: float, width: int = 20) -> Text:
+    filled = int(width * min(pct, 100) / 100)
+    color = get_color(pct)
+    t = Text()
+    t.append("█" * filled, style=color)
+    t.append("░" * (width - filled), style="bright_black")
+    t.append(f" {pct:.0f}%", style=f"bold {color}")
+    return t
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Data Functions
+# Data fetchers (with caching)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_sessions() -> list[dict]:
-    """Load sessions from sessions.json with cost/token data."""
+def get_health():
+    now = time.time()
+    if now - cached_health["time"] < SLOW_INTERVAL:
+        return cached_health["data"]
+    
+    try:
+        env = os.environ.copy()
+        env["PATH"] = f"{HOME}/.npm-global/bin:{env.get('PATH', '')}"
+        result = subprocess.run(
+            ["openclaw", "health", "--json"],
+            capture_output=True, text=True, timeout=5, env=env
+        )
+        if result.returncode == 0:
+            cached_health["data"] = json.loads(result.stdout)
+            cached_health["time"] = now
+    except:
+        pass
+    return cached_health["data"]
+
+
+def get_sessions():
+    now = time.time()
+    if now - cached_sessions["time"] < MEDIUM_INTERVAL:
+        return cached_sessions["data"]
+    
     try:
         sess_file = SESS_DIR / 'sessions.json'
-        if not sess_file.exists():
-            return []
-        data = json.loads(sess_file.read_text())
-        sessions = []
-        for key, s in data.items():
-            # Resolve friendly name
-            if ':main:main' in key:
-                label = 'main'
-            elif 'cron:' in key:
-                label = s.get('label', 'cron-' + key.split('cron:')[1][:8])
-            elif 'subagent' in key:
-                label = 'sub-' + key.split(':')[-1][:8]
-            else:
-                label = s.get('label', key.split(':')[-1][:12])
-            
-            sessions.append({
-                'key': key,
-                'label': label,
-                'model': (s.get('modelOverride') or s.get('model') or '-').split('/')[-1],
-                'tokens': s.get('totalTokens', 0),
-                'context': s.get('contextTokens', 0),
-                'updated': s.get('updatedAt', 0),
-                'channel': s.get('channel', '-'),
-                'sessionId': s.get('sessionId', key),
-            })
-        sessions.sort(key=lambda x: x['updated'], reverse=True)
-        return sessions
-    except Exception:
-        return []
+        if sess_file.exists():
+            data = json.loads(sess_file.read_text())
+            sessions = []
+            for key, s in data.items():
+                label = 'main' if ':main:main' in key else s.get('label', key.split(':')[-1][:12])
+                sessions.append({
+                    'label': label,
+                    'model': (s.get('model') or '-').split('/')[-1][:12],
+                    'tokens': s.get('totalTokens', 0),
+                    'updated': s.get('updatedAt', 0),
+                })
+            sessions.sort(key=lambda x: x['updated'], reverse=True)
+            cached_sessions["data"] = sessions[:8]
+            cached_sessions["time"] = now
+    except:
+        pass
+    return cached_sessions["data"]
 
 
-def get_usage_5h() -> dict:
-    """Get 5-hour rolling window usage stats."""
+def get_usage():
+    now = time.time()
+    if now - cached_usage["time"] < SLOW_INTERVAL:
+        return cached_usage["data"]
+    
     try:
-        now = datetime.now().timestamp() * 1000
+        now_ms = now * 1000
         five_hours_ms = 5 * 3600 * 1000
-        
         per_model = {}
         total_cost = 0
         total_calls = 0
         recent = []
         
         for f in SESS_DIR.glob('*.jsonl'):
-            try:
-                # Skip old files
-                if f.stat().st_mtime * 1000 < now - five_hours_ms:
-                    continue
-                for line in f.read_text().splitlines():
-                    if not line.strip():
-                        continue
-                    try:
-                        d = json.loads(line)
-                        if d.get('type') != 'message':
-                            continue
-                        msg = d.get('message', {})
-                        ts_str = d.get('timestamp', '')
-                        if not ts_str:
-                            continue
-                        ts = datetime.fromisoformat(ts_str.replace('Z', '+00:00')).timestamp() * 1000
-                        if now - ts > five_hours_ms:
-                            continue
-                        
-                        usage = msg.get('usage', {})
-                        model = (msg.get('model', 'unknown')).split('/')[-1]
-                        if 'delivery-mirror' in model:
-                            continue
-                        
-                        in_tok = usage.get('input', 0) + usage.get('cacheRead', 0) + usage.get('cacheWrite', 0)
-                        out_tok = usage.get('output', 0)
-                        cost = usage.get('cost', {}).get('total', 0)
-                        
-                        if model not in per_model:
-                            per_model[model] = {'input': 0, 'output': 0, 'cost': 0, 'calls': 0}
-                        per_model[model]['input'] += in_tok
-                        per_model[model]['output'] += out_tok
-                        per_model[model]['cost'] += cost
-                        per_model[model]['calls'] += 1
-                        
-                        total_cost += cost
-                        total_calls += 1
-                        
-                        # Track recent for burn rate
-                        recent.append({'ts': ts, 'output': out_tok, 'cost': cost})
-                    except:
-                        continue
-            except:
+            if f.stat().st_mtime * 1000 < now_ms - five_hours_ms:
                 continue
+            for line in f.read_text().splitlines()[-100:]:
+                try:
+                    d = json.loads(line)
+                    if d.get('type') != 'message':
+                        continue
+                    msg = d.get('message', {})
+                    ts = d.get('timestamp', '')
+                    if not ts:
+                        continue
+                    ts_ms = datetime.fromisoformat(ts.replace('Z', '+00:00')).timestamp() * 1000
+                    if now_ms - ts_ms > five_hours_ms:
+                        continue
+                    
+                    usage = msg.get('usage', {})
+                    model = msg.get('model', 'unknown').split('/')[-1]
+                    if 'delivery' in model:
+                        continue
+                    
+                    out_tok = usage.get('output', 0)
+                    cost = usage.get('cost', {}).get('total', 0)
+                    
+                    if model not in per_model:
+                        per_model[model] = {'output': 0, 'cost': 0, 'calls': 0}
+                    per_model[model]['output'] += out_tok
+                    per_model[model]['cost'] += cost
+                    per_model[model]['calls'] += 1
+                    total_cost += cost
+                    total_calls += 1
+                    recent.append({'ts': ts_ms, 'output': out_tok, 'cost': cost})
+                except:
+                    continue
         
-        # Calculate burn rate (last 30 min)
-        thirty_min_ago = now - 30 * 60 * 1000
+        # Burn rate (last 30 min)
+        thirty_min_ago = now_ms - 30 * 60 * 1000
         recent_30 = [r for r in recent if r['ts'] >= thirty_min_ago]
-        burn_tokens = 0
-        burn_cost = 0
+        burn_tokens = burn_cost = 0
         if recent_30:
-            total_out = sum(r['output'] for r in recent_30)
-            total_cost_30 = sum(r['cost'] for r in recent_30)
-            span_ms = max(now - min(r['ts'] for r in recent_30), 60000)
-            burn_tokens = total_out / (span_ms / 60000)
-            burn_cost = total_cost_30 / (span_ms / 60000)
+            span_ms = max(now_ms - min(r['ts'] for r in recent_30), 60000)
+            burn_tokens = sum(r['output'] for r in recent_30) / (span_ms / 60000)
+            burn_cost = sum(r['cost'] for r in recent_30) / (span_ms / 60000)
         
-        # Estimated limits
-        opus_limit = 88000
-        sonnet_limit = 220000
+        # Rate limits
         opus_out = sum(v['output'] for k, v in per_model.items() if 'opus' in k.lower())
         sonnet_out = sum(v['output'] for k, v in per_model.items() if 'sonnet' in k.lower())
         
-        return {
+        cached_usage["data"] = {
             'per_model': per_model,
             'total_cost': total_cost,
             'total_calls': total_calls,
-            'burn_tokens_per_min': burn_tokens,
-            'burn_cost_per_min': burn_cost,
+            'burn_tokens': burn_tokens,
+            'burn_cost': burn_cost,
             'opus_out': opus_out,
-            'opus_pct': (opus_out / opus_limit * 100) if opus_limit else 0,
+            'opus_pct': (opus_out / 88000 * 100),
             'sonnet_out': sonnet_out,
-            'sonnet_pct': (sonnet_out / sonnet_limit * 100) if sonnet_limit else 0,
+            'sonnet_pct': (sonnet_out / 220000 * 100),
         }
-    except Exception:
-        return {'per_model': {}, 'total_cost': 0, 'total_calls': 0}
+        cached_usage["time"] = now
+    except:
+        pass
+    return cached_usage["data"]
 
 
-def get_costs() -> dict:
-    """Get cost breakdown by day and model."""
+def get_costs():
+    now = time.time()
+    if now - cached_costs["time"] < SLOW_INTERVAL:
+        return cached_costs["data"]
+    
     try:
         per_day = {}
         per_model = {}
         total = 0
-        
-        for f in SESS_DIR.glob('*.jsonl'):
-            try:
-                for line in f.read_text().splitlines():
-                    if not line.strip():
-                        continue
-                    try:
-                        d = json.loads(line)
-                        if d.get('type') != 'message':
-                            continue
-                        msg = d.get('message', {})
-                        cost = msg.get('usage', {}).get('cost', {}).get('total', 0)
-                        if cost <= 0:
-                            continue
-                        
-                        model = (msg.get('model', 'unknown')).split('/')[-1]
-                        if 'delivery-mirror' in model:
-                            continue
-                        ts_str = d.get('timestamp', '')[:10]
-                        
-                        per_model[model] = per_model.get(model, 0) + cost
-                        per_day[ts_str] = per_day.get(ts_str, 0) + cost
-                        total += cost
-                    except:
-                        continue
-            except:
-                continue
-        
         today = datetime.now().strftime('%Y-%m-%d')
         week_ago = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
+        
+        for f in SESS_DIR.glob('*.jsonl'):
+            for line in f.read_text().splitlines():
+                try:
+                    d = json.loads(line)
+                    if d.get('type') != 'message':
+                        continue
+                    msg = d.get('message', {})
+                    cost = msg.get('usage', {}).get('cost', {}).get('total', 0)
+                    if cost <= 0:
+                        continue
+                    day = d.get('timestamp', '')[:10]
+                    model = msg.get('model', 'unknown').split('/')[-1]
+                    if 'delivery' in model:
+                        continue
+                    per_day[day] = per_day.get(day, 0) + cost
+                    per_model[model] = per_model.get(model, 0) + cost
+                    total += cost
+                except:
+                    continue
+        
         week_cost = sum(c for d, c in per_day.items() if d >= week_ago)
         
-        return {
+        cached_costs["data"] = {
             'total': total,
             'today': per_day.get(today, 0),
             'week': week_cost,
-            'per_model': dict(sorted(per_model.items(), key=lambda x: -x[1])[:5]),
-            'per_day': dict(sorted(per_day.items(), reverse=True)[:7]),
+            'per_day': dict(sorted(per_day.items(), reverse=True)[:5]),
+            'per_model': dict(sorted(per_model.items(), key=lambda x: -x[1])[:4]),
         }
+        cached_costs["time"] = now
     except:
-        return {'total': 0, 'today': 0, 'week': 0, 'per_model': {}, 'per_day': {}}
+        pass
+    return cached_costs["data"]
 
 
-def get_crons() -> list[dict]:
-    """Load cron jobs."""
+def get_crons():
+    now = time.time()
+    if now - cached_crons["time"] < SLOW_INTERVAL:
+        return cached_crons["data"]
+    
     try:
-        if not CRON_FILE.exists():
-            return []
-        data = json.loads(CRON_FILE.read_text())
-        jobs = []
-        for j in data.get('jobs', []):
-            schedule = j.get('schedule', {})
-            sched_str = schedule.get('expr', schedule.get('every', '?'))
-            jobs.append({
-                'id': j.get('id', '')[:8],
-                'name': j.get('name', j.get('id', '')[:8]),
-                'schedule': sched_str,
-                'enabled': j.get('enabled', True),
-                'last_run': j.get('state', {}).get('lastRunAtMs', 0),
-                'last_status': j.get('state', {}).get('lastStatus', 'unknown'),
-            })
-        return jobs
+        if CRON_FILE.exists():
+            data = json.loads(CRON_FILE.read_text())
+            jobs = []
+            for j in data.get('jobs', []):
+                jobs.append({
+                    'name': j.get('name', j.get('id', '')[:8])[:25],
+                    'enabled': j.get('enabled', True),
+                    'last_run': j.get('state', {}).get('lastRunAtMs', 0),
+                })
+            cached_crons["data"] = jobs[:6]
+            cached_crons["time"] = now
     except:
-        return []
+        pass
+    return cached_crons["data"]
 
 
-def get_live_messages(limit: int = 15) -> list[dict]:
-    """Get recent messages from all sessions."""
-    messages = []
+def get_messages():
+    now = time.time()
+    if now - cached_messages["time"] < MEDIUM_INTERVAL:
+        return cached_messages["data"]
+    
     try:
-        now = datetime.now().timestamp() * 1000
-        one_hour_ms = 3600 * 1000
+        messages = []
+        now_ms = now * 1000
         
-        for f in sorted(SESS_DIR.glob('*.jsonl'), key=lambda x: x.stat().st_mtime, reverse=True)[:10]:
-            try:
-                lines = f.read_text().splitlines()[-50:]  # Last 50 lines
-                for line in reversed(lines):
-                    if not line.strip():
+        for f in sorted(SESS_DIR.glob('*.jsonl'), key=lambda x: x.stat().st_mtime, reverse=True)[:5]:
+            for line in f.read_text().splitlines()[-20:]:
+                try:
+                    d = json.loads(line)
+                    if d.get('type') != 'message':
                         continue
-                    try:
-                        d = json.loads(line)
-                        if d.get('type') != 'message':
-                            continue
-                        msg = d.get('message', {})
-                        role = msg.get('role', '')
-                        if role not in ('user', 'assistant'):
-                            continue
-                        
-                        ts_str = d.get('timestamp', '')
-                        if not ts_str:
-                            continue
-                        ts = datetime.fromisoformat(ts_str.replace('Z', '+00:00')).timestamp() * 1000
-                        if now - ts > one_hour_ms:
-                            continue
-                        
-                        content = msg.get('content', '')
-                        if isinstance(content, list):
-                            for block in content:
-                                if block.get('type') == 'text':
-                                    content = block.get('text', '')
-                                    break
-                            else:
-                                content = str(content[0]) if content else ''
-                        
-                        if isinstance(content, str):
-                            content = content.replace('\n', ' ')[:150]
-                        
-                        messages.append({
-                            'ts': ts,
-                            'role': role,
-                            'content': content,
-                            'session': f.stem[:8],
-                        })
-                    except:
+                    msg = d.get('message', {})
+                    role = msg.get('role', '')
+                    if role not in ('user', 'assistant'):
                         continue
-            except:
-                continue
+                    
+                    ts = d.get('timestamp', '')
+                    ts_ms = datetime.fromisoformat(ts.replace('Z', '+00:00')).timestamp() * 1000
+                    if now_ms - ts_ms > 3600000:
+                        continue
+                    
+                    content = msg.get('content', '')
+                    if isinstance(content, list):
+                        content = next((b.get('text', '') for b in content if b.get('type') == 'text'), '')
+                    
+                    messages.append({
+                        'ts': ts_ms,
+                        'role': role[0].upper(),
+                        'text': str(content).replace('\n', ' ')[:120]
+                    })
+                except:
+                    continue
         
         messages.sort(key=lambda x: x['ts'], reverse=True)
-        return messages[:limit]
+        cached_messages["data"] = messages[:8]
+        cached_messages["time"] = now
     except:
-        return []
+        pass
+    return cached_messages["data"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Panels
 # ─────────────────────────────────────────────────────────────────────────────
 
-class OverviewPanel(Static):
-    """Main overview with system + OpenClaw health."""
+def make_overview() -> Panel:
+    lines = []
     
-    def on_mount(self) -> None:
-        self.cpu_history: list[float] = []
-        self.ram_history: list[float] = []
-        self.max_history = 60  # 2 min at 2s intervals
-        self.set_interval(2, self.refresh_stats)
+    # Health
+    health = get_health()
+    if health and health.get('ok'):
+        channels = [n for n, i in health.get('channels', {}).items() 
+                   if i.get('configured') and i.get('probe', {}).get('ok')]
+        lines.append(Text("● OPENCLAW ONLINE", style="bold green"))
+        if channels:
+            lines.append(Text(f"  {', '.join(channels)}", style="cyan"))
+    else:
+        lines.append(Text("● OPENCLAW OFFLINE", style="bold red"))
     
-    def refresh_stats(self) -> None:
-        self.update(self.render_stats())
+    lines.append(Text())
     
-    def render_stats(self) -> Panel:
-        lines = []
-        
-        # OpenClaw status
-        ok, output = run_cmd(["openclaw", "health", "--json"], timeout=5)
-        if ok:
-            try:
-                data = json.loads(output)
-                if data.get("ok"):
-                    lines.append(Text("● OPENCLAW ", style="bold green") + Text("ONLINE", style="green"))
-                    channels = []
-                    for name, info in data.get("channels", {}).items():
-                        if info.get("configured") and info.get("probe", {}).get("ok"):
-                            channels.append(name)
-                    if channels:
-                        lines.append(Text(f"  Channels: {', '.join(channels)}", style="cyan"))
-                else:
-                    lines.append(Text("● OPENCLAW DEGRADED", style="bold yellow"))
-            except:
-                lines.append(Text("● OPENCLAW ???", style="dim"))
-        else:
-            lines.append(Text("● OPENCLAW OFFLINE", style="bold red"))
-        
-        lines.append(Text())
-        
-        # System stats
-        cpu = psutil.cpu_percent(interval=None)
-        mem = psutil.virtual_memory()
-        disk = psutil.disk_usage('/')
-        
-        # Track history
-        self.cpu_history.append(cpu)
-        self.ram_history.append(mem.percent)
-        if len(self.cpu_history) > self.max_history:
-            self.cpu_history = self.cpu_history[-self.max_history:]
-        if len(self.ram_history) > self.max_history:
-            self.ram_history = self.ram_history[-self.max_history:]
-        
-        lines.append(Text("SYSTEM", style="bold white"))
-        
-        # CPU with inline sparkline
-        cpu_line = Text("  CPU ")
-        cpu_line.append_text(make_sparkline(self.cpu_history, width=16, color=get_color(cpu), ascii_mode=ASCII_SPARKLINES))
-        cpu_line.append(f" {cpu:3.0f}%", style="bold " + get_color(cpu))
-        lines.append(cpu_line)
-        
-        # RAM with inline sparkline
-        ram_line = Text("  RAM ")
-        ram_line.append_text(make_sparkline(self.ram_history, width=16, color=get_color(mem.percent), ascii_mode=ASCII_SPARKLINES))
-        ram_line.append(f" {mem.percent:3.0f}% {mem.used/1024**3:.1f}G", style="bold " + get_color(mem.percent))
-        lines.append(ram_line)
-        
-        # Disk bar
-        lines.append(Text("  DISK ") + make_bar(disk.percent, width=16, label=f"{disk.free/1024**3:.0f}G free"))
-        
-        # GPU if available
-        if HAS_NVIDIA:
-            try:
-                handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-                util = pynvml.nvmlDeviceGetUtilizationRates(handle)
-                mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-                mem_pct = (mem_info.used / mem_info.total) * 100
-                lines.append(Text("  GPU  ") + make_bar(util.gpu, width=16))
-                lines.append(Text("  VRAM ") + make_bar(mem_pct, width=16, label=f"{mem_info.used/1024**3:.1f}G/{mem_info.total/1024**3:.0f}G"))
-            except:
-                pass
-        
-        lines.append(Text())
-        
-        # Load average
-        load1, load5, load15 = psutil.getloadavg()
-        lines.append(Text(f"  Load: {load1:.2f} / {load5:.2f} / {load15:.2f}", style="dim"))
-        
-        # Uptime
-        uptime_sec = int(datetime.now().timestamp() - psutil.boot_time())
-        days, rem = divmod(uptime_sec, 86400)
-        hours, rem = divmod(rem, 3600)
-        mins = rem // 60
-        lines.append(Text(f"  Uptime: {days}d {hours}h {mins}m", style="dim"))
-        
-        return Panel(Group(*lines), title="[bold cyan]Overview[/bold cyan]", border_style="cyan")
+    # System
+    cpu = psutil.cpu_percent(interval=None)
+    mem = psutil.virtual_memory()
+    disk = psutil.disk_usage('/')
+    
+    cpu_history.append(cpu)
+    ram_history.append(mem.percent)
+    while len(cpu_history) > MAX_HISTORY:
+        cpu_history.pop(0)
+    while len(ram_history) > MAX_HISTORY:
+        ram_history.pop(0)
+    
+    lines.append(Text(f"CPU  {sparkline(cpu_history, 12)} {cpu:3.0f}%", style=get_color(cpu)))
+    lines.append(Text(f"RAM  {sparkline(ram_history, 12)} {mem.percent:3.0f}% {mem.used/1024**3:.1f}G", style=get_color(mem.percent)))
+    lines.append(Text(f"DISK ") + bar(disk.percent, 10) + Text(f" {disk.free/1024**3:.0f}G free", style="dim"))
+    
+    if HAS_NVIDIA:
+        try:
+            h = pynvml.nvmlDeviceGetHandleByIndex(0)
+            gpu = pynvml.nvmlDeviceGetUtilizationRates(h).gpu
+            vram = pynvml.nvmlDeviceGetMemoryInfo(h)
+            vram_pct = (vram.used / vram.total) * 100
+            lines.append(Text(f"GPU  ") + bar(gpu, 10))
+            lines.append(Text(f"VRAM ") + bar(vram_pct, 10) + Text(f" {vram.used/1024**3:.1f}G/{vram.total/1024**3:.0f}G", style="dim"))
+        except:
+            pass
+    
+    load = psutil.getloadavg()
+    uptime_sec = int(time.time() - psutil.boot_time())
+    days, rem = divmod(uptime_sec, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins = rem // 60
+    lines.append(Text(f"\nLoad: {load[0]:.2f} / {load[1]:.2f} / {load[2]:.2f}", style="dim"))
+    lines.append(Text(f"Uptime: {days}d {hours}h {mins}m", style="dim"))
+    
+    return Panel("\n".join(str(l) for l in lines), title="Overview", border_style="cyan")
 
 
-class UsagePanel(Static):
-    """5-hour rolling window usage."""
+def make_usage() -> Panel:
+    usage = get_usage()
+    lines = []
     
-    def on_mount(self) -> None:
-        self.set_interval(2, self.refresh_stats)
+    # Per model
+    for model, data in sorted(usage.get('per_model', {}).items(), key=lambda x: -x[1]['output'])[:3]:
+        lines.append(f"{model[:18]:<18} {format_tokens(data['output']):>6} {format_cost(data['cost']):>7}")
     
-    def refresh_stats(self) -> None:
-        self.update(self.render_stats())
+    if not usage.get('per_model'):
+        lines.append("No activity")
     
-    def render_stats(self) -> Panel:
-        usage = get_usage_5h()
-        lines = []
-        
-        lines.append(Text("5-HOUR WINDOW", style="bold yellow"))
-        lines.append(Text())
-        
-        # Model breakdown
-        for model, data in sorted(usage.get('per_model', {}).items(), key=lambda x: -x[1]['output'])[:4]:
-            out = format_tokens(data['output'])
-            cost = format_cost(data['cost'])
-            lines.append(Text(f"  {model[:20]:<20} {out:>8} out  {cost:>8}", style="white"))
-        
-        if not usage.get('per_model'):
-            lines.append(Text("  No activity", style="dim"))
-        
-        lines.append(Text())
-        
-        # Limits
-        lines.append(Text("RATE LIMITS", style="bold"))
-        lines.append(Text("  Opus   ") + make_bar(usage.get('opus_pct', 0), width=20, label=format_tokens(usage.get('opus_out', 0))))
-        lines.append(Text("  Sonnet ") + make_bar(usage.get('sonnet_pct', 0), width=20, label=format_tokens(usage.get('sonnet_out', 0))))
-        
-        lines.append(Text())
-        
-        # Totals
-        lines.append(Text(f"  Total Cost: {format_cost(usage.get('total_cost', 0))}", style="cyan"))
-        lines.append(Text(f"  Total Calls: {usage.get('total_calls', 0)}", style="dim"))
-        
-        # Burn rate
-        burn_tok = usage.get('burn_tokens_per_min', 0)
-        burn_cost = usage.get('burn_cost_per_min', 0)
-        if burn_tok > 0:
-            lines.append(Text(f"  Burn: {format_tokens(int(burn_tok))}/min ({format_cost(burn_cost)}/min)", style="yellow"))
-        
-        return Panel(Group(*lines), title="[bold yellow]Usage[/bold yellow]", border_style="yellow")
+    lines.append("")
+    
+    # Rate limits
+    opus_pct = usage.get('opus_pct', 0)
+    sonnet_pct = usage.get('sonnet_pct', 0)
+    lines.append(f"Opus   {bar(opus_pct, 10)} {format_tokens(usage.get('opus_out', 0))}")
+    lines.append(f"Sonnet {bar(sonnet_pct, 10)} {format_tokens(usage.get('sonnet_out', 0))}")
+    
+    lines.append("")
+    lines.append(f"Cost: {format_cost(usage.get('total_cost', 0))}  Calls: {usage.get('total_calls', 0)}")
+    
+    # Burn rate
+    burn_tok = usage.get('burn_tokens', 0)
+    burn_cost = usage.get('burn_cost', 0)
+    if burn_tok > 0:
+        lines.append(f"Burn: {format_tokens(int(burn_tok))}/min ({format_cost(burn_cost)}/min)")
+    
+    return Panel("\n".join(str(l) for l in lines), title="Usage (5h)", border_style="yellow")
 
 
-class CostsPanel(Static):
-    """Cost tracking."""
-    
-    def on_mount(self) -> None:
-        self.set_interval(2, self.refresh_stats)
-    
-    def refresh_stats(self) -> None:
-        self.update(self.render_stats())
-    
-    def render_stats(self) -> Panel:
-        costs = get_costs()
-        lines = []
-        
-        # Summary
-        lines.append(Text("SPENDING", style="bold green"))
-        lines.append(Text(f"  Today:    {format_cost(costs.get('today', 0))}", style="white"))
-        lines.append(Text(f"  This Week: {format_cost(costs.get('week', 0))}", style="white"))
-        lines.append(Text(f"  All Time:  {format_cost(costs.get('total', 0))}", style="cyan bold"))
-        
-        lines.append(Text())
-        
-        # By model
-        lines.append(Text("BY MODEL", style="bold"))
-        for model, cost in list(costs.get('per_model', {}).items())[:4]:
-            lines.append(Text(f"  {model[:18]:<18} {format_cost(cost):>10}", style="white"))
-        
-        lines.append(Text())
-        
-        # By day (last 5)
-        lines.append(Text("RECENT DAYS", style="bold"))
-        for day, cost in list(costs.get('per_day', {}).items())[:5]:
-            lines.append(Text(f"  {day}  {format_cost(cost):>10}", style="dim"))
-        
-        return Panel(Group(*lines), title="[bold green]Costs[/bold green]", border_style="green")
-
-
-class SessionsPanel(Static):
-    """Active sessions list."""
-    
-    def on_mount(self) -> None:
-        self.set_interval(10, self.refresh_stats)
-    
-    def refresh_stats(self) -> None:
-        self.update(self.render_stats())
-    
-    def render_stats(self) -> Panel:
-        sessions = get_sessions()[:12]
-        lines = []
-        
-        lines.append(Text("SESSIONS", style="bold magenta"))
-        lines.append(Text())
-        
-        for s in sessions:
-            ago = format_ago(s['updated'])
-            tokens = format_tokens(s['tokens'])
-            model = s['model'][:12]
-            label = s['label'][:15]
-            
-            # Color based on recency
-            if 'just now' in ago or 'm ago' in ago:
-                style = "green"
-            elif 'h ago' in ago:
-                style = "yellow"
-            else:
-                style = "dim"
-            
-            lines.append(Text(f"  {label:<15} {model:<12} {tokens:>8} {ago:>10}", style=style))
-        
-        if not sessions:
-            lines.append(Text("  No sessions", style="dim"))
-        
-        return Panel(Group(*lines), title="[bold magenta]Sessions[/bold magenta]", border_style="magenta")
-
-
-class CronsPanel(Static):
-    """Cron jobs status."""
-    
-    def on_mount(self) -> None:
-        self.set_interval(30, self.refresh_stats)
-    
-    def refresh_stats(self) -> None:
-        self.update(self.render_stats())
-    
-    def render_stats(self) -> Panel:
-        crons = get_crons()[:8]
-        lines = []
-        
-        lines.append(Text("CRON JOBS", style="bold blue"))
-        lines.append(Text())
-        
-        for c in crons:
-            status_icon = "●" if c['enabled'] else "○"
-            status_color = "green" if c['enabled'] else "dim"
-            last = format_ago(c['last_run'])
-            name = c['name'][:28]
-            
-            line = Text()
-            line.append(f"  {status_icon} ", style=status_color)
-            line.append(f"{name:<28} ", style="white" if c['enabled'] else "dim")
-            line.append(f"{last}", style="bright_black")
-            lines.append(line)
-        
-        if not crons:
-            lines.append(Text("  No cron jobs", style="dim"))
-        
-        return Panel(Group(*lines), title="[bold blue]Crons[/bold blue]", border_style="blue")
-
-
-class LiveFeedPanel(Static):
-    """Recent messages feed."""
-    
-    def on_mount(self) -> None:
-        self.set_interval(5, self.refresh_stats)
-    
-    def refresh_stats(self) -> None:
-        self.update(self.render_stats())
-    
-    def render_stats(self) -> Panel:
-        messages = get_live_messages(10)
-        lines = []
-        
-        lines.append(Text("LIVE FEED", style="bold red"))
-        lines.append(Text())
-        
-        for m in messages:
-            role = m['role'][:1].upper()
-            content = m['content'][:120]  # More space now with 2 columns
-            
-            role_color = "cyan" if role == 'U' else "green"
-            line = Text()
-            line.append(f"  [{role}] ", style=role_color)
-            line.append(f"{content}", style="white")
-            lines.append(line)
-        
-        if not messages:
-            lines.append(Text("  No recent messages", style="dim"))
-        
-        return Panel(Group(*lines), title="[bold red]Live Feed[/bold red]", border_style="red")
-
-
-class TopProcessesPanel(Static):
-    """Top processes by CPU usage."""
-    
-    def on_mount(self) -> None:
-        self.set_interval(2, self.refresh_stats)
-    
-    def refresh_stats(self) -> None:
-        self.update(self.render_stats())
-    
-    def render_stats(self) -> Panel:
-        lines = []
-        lines.append(Text("TOP PROCESSES", style="bold white"))
-        lines.append(Text())
-        
-        # Get top processes by CPU
-        procs = []
-        for proc in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent']):
-            try:
-                info = proc.info
-                cpu = info.get('cpu_percent', 0) or 0
-                mem = info.get('memory_percent', 0) or 0
-                if cpu > 0 or mem > 1:
-                    procs.append({
-                        'name': info.get('name', '?')[:20],
-                        'cpu': cpu,
-                        'mem': mem,
-                    })
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
-        
-        # Sort by CPU, take top 8
-        procs.sort(key=lambda x: x['cpu'], reverse=True)
-        
-        for p in procs[:8]:
-            cpu_color = "red" if p['cpu'] > 50 else ("yellow" if p['cpu'] > 20 else "white")
-            line = Text()
-            line.append(f"  {p['name']:<20} ", style="white")
-            line.append(f"{p['cpu']:5.1f}%", style=cpu_color)
-            line.append(f" {p['mem']:5.1f}%", style="dim")
-            lines.append(line)
-        
-        if not procs:
-            lines.append(Text("  No processes", style="dim"))
-        
-        # Header hint
-        lines.append(Text())
-        lines.append(Text("  NAME                  CPU   MEM", style="bright_black"))
-        
-        return Panel(Group(*lines), title="[bold white]Processes[/bold white]", border_style="white")
-
-
-class NetworkPanel(Static):
-    """Network stats with sparkline history."""
-    
-    def on_mount(self) -> None:
-        self.net_last = {"sent": 0, "recv": 0, "time": 0}
-        self.upload_history: list[float] = []
-        self.download_history: list[float] = []
-        self.max_history = 60  # 2 min at 2s intervals
-        self.set_interval(2, self.refresh_stats)
-    
-    def refresh_stats(self) -> None:
-        self.update(self.render_stats())
-    
-    def render_stats(self) -> Panel:
-        net = psutil.net_io_counters()
-        now = datetime.now().timestamp()
-        
-        if self.net_last["time"] > 0:
-            dt = now - self.net_last["time"]
-            if dt > 0:
-                sent_rate = (net.bytes_sent - self.net_last["sent"]) / dt
-                recv_rate = (net.bytes_recv - self.net_last["recv"]) / dt
-            else:
-                sent_rate = recv_rate = 0
-        else:
-            sent_rate = recv_rate = 0
-        
-        self.net_last = {"sent": net.bytes_sent, "recv": net.bytes_recv, "time": now}
-        
-        # Track history
-        self.upload_history.append(sent_rate)
-        self.download_history.append(recv_rate)
-        if len(self.upload_history) > self.max_history:
-            self.upload_history = self.upload_history[-self.max_history:]
-        if len(self.download_history) > self.max_history:
-            self.download_history = self.download_history[-self.max_history:]
-        
-        # Peak values
-        peak_up = max(self.upload_history) if self.upload_history else 0
-        peak_down = max(self.download_history) if self.download_history else 0
-        
-        lines = []
-        lines.append(Text("NETWORK", style="bold yellow"))
-        lines.append(Text())
-        
-        # Calculate scale - at least 1MB/s so small traffic shows as small
-        min_scale = 1024 * 1024  # 1 MB/s minimum
-        max_up = max(max(self.upload_history) if self.upload_history else 0, min_scale)
-        max_down = max(max(self.download_history) if self.download_history else 0, min_scale)
-        
-        # Upload with inline sparkline
-        up_line = Text("  ↑ ")
-        up_line.append_text(make_sparkline(self.upload_history, width=20, color="red", max_cap=max_up, ascii_mode=ASCII_SPARKLINES))
-        up_line.append(f" {format_bytes(sent_rate):>9}/s", style="bold red")
-        lines.append(up_line)
-        
-        # Download with inline sparkline  
-        down_line = Text("  ↓ ")
-        down_line.append_text(make_sparkline(self.download_history, width=20, color="green", max_cap=max_down, ascii_mode=ASCII_SPARKLINES))
-        down_line.append(f" {format_bytes(recv_rate):>9}/s", style="bold green")
-        lines.append(down_line)
-        
-        lines.append(Text())
-        lines.append(Text(f"  Peak  ↑ {format_bytes(peak_up)}/s  ↓ {format_bytes(peak_down)}/s", style="dim"))
-        lines.append(Text(f"  Total ↑ {format_bytes(net.bytes_sent)}  ↓ {format_bytes(net.bytes_recv)}", style="dim"))
-        lines.append(Text(f"  Scale: {format_bytes(max(max_up, max_down))}/s", style="bright_black"))
-        
-        return Panel(Group(*lines), title="[bold yellow]Network[/bold yellow]", border_style="yellow")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# App
-# ─────────────────────────────────────────────────────────────────────────────
-
-class OpenClawDashboard(App):
-    """OpenClaw TUI Dashboard."""
-    
-    CSS = """
-    Screen {
-        layout: grid;
-        grid-size: 3 3;
-        grid-gutter: 1;
-        padding: 1;
-    }
-    
-    LiveFeedPanel {
-        column-span: 2;
-    }
-    """
-    
-    BINDINGS = [
-        ("q", "quit", "Quit"),
-        ("r", "refresh", "Refresh"),
+def make_costs() -> Panel:
+    costs = get_costs()
+    lines = [
+        f"Today:     {format_cost(costs.get('today', 0))}",
+        f"This Week: {format_cost(costs.get('week', 0))}",
+        f"All Time:  {format_cost(costs.get('total', 0))}",
+        ""
     ]
     
-    def compose(self) -> ComposeResult:
-        yield Header(show_clock=True)
-        # Row 1
-        yield OverviewPanel()
-        yield UsagePanel()
-        yield CostsPanel()
-        # Row 2
-        yield SessionsPanel()
-        yield CronsPanel()
-        yield TopProcessesPanel()
-        # Row 3
-        yield NetworkPanel()
-        yield LiveFeedPanel()  # spans 2 columns
-        yield Footer()
+    # By model
+    for model, cost in list(costs.get('per_model', {}).items())[:3]:
+        lines.append(f"  {model[:14]:<14} {format_cost(cost):>8}")
     
-    def action_refresh(self) -> None:
-        for widget in self.query("OverviewPanel, UsagePanel, CostsPanel, SessionsPanel, CronsPanel, LiveFeedPanel, TopProcessesPanel, NetworkPanel"):
-            if hasattr(widget, 'refresh_stats'):
-                widget.refresh_stats()
+    lines.append("")
+    
+    # Recent days
+    for day, cost in list(costs.get('per_day', {}).items())[:3]:
+        lines.append(f"  {day} {format_cost(cost):>8}")
+    
+    return Panel("\n".join(lines), title="Costs", border_style="green")
 
+
+def make_sessions() -> Panel:
+    sessions = get_sessions()
+    lines = []
+    
+    for s in sessions:
+        ago = format_ago(s['updated'])
+        style = "green" if 'now' in ago or 'm' in ago else ("yellow" if 'h' in ago else "dim")
+        lines.append(f"[{style}]{s['label']:<12} {s['model']:<10} {format_tokens(s['tokens']):>6} {ago:>4}[/]")
+    
+    if not sessions:
+        lines.append("  No sessions")
+    
+    return Panel("\n".join(lines), title="Sessions", border_style="magenta")
+
+
+def make_crons() -> Panel:
+    crons = get_crons()
+    lines = []
+    
+    for c in crons:
+        icon = "●" if c['enabled'] else "○"
+        color = "green" if c['enabled'] else "dim"
+        lines.append(f"  [{color}]{icon}[/] {c['name']:<20} {format_ago(c['last_run']):>4}")
+    
+    if not crons:
+        lines.append("  No crons")
+    
+    return Panel("\n".join(lines), title="Crons", border_style="blue")
+
+
+def make_processes() -> Panel:
+    lines = []
+    procs = []
+    
+    for p in psutil.process_iter(['name', 'cpu_percent', 'memory_percent']):
+        try:
+            cpu = p.info.get('cpu_percent', 0) or 0
+            mem = p.info.get('memory_percent', 0) or 0
+            if cpu > 0.1 or mem > 1:
+                procs.append((p.info.get('name', '?')[:16], cpu, mem))
+        except:
+            pass
+    
+    for name, cpu, mem in sorted(procs, key=lambda x: -x[1])[:6]:
+        color = "red" if cpu > 50 else ("yellow" if cpu > 20 else "white")
+        lines.append(f"[{color}]{name:<16} {cpu:5.1f}% {mem:5.1f}%[/]")
+    
+    if not lines:
+        lines.append("  Idle")
+    
+    lines.append("")
+    lines.append("[dim]NAME             CPU   MEM[/]")
+    
+    return Panel("\n".join(lines), title="Processes", border_style="white")
+
+
+def make_network() -> Panel:
+    global last_net
+    
+    net = psutil.net_io_counters()
+    now = time.time()
+    
+    if last_net["time"] > 0:
+        dt = now - last_net["time"]
+        up_rate = (net.bytes_sent - last_net["sent"]) / dt if dt > 0 else 0
+        dn_rate = (net.bytes_recv - last_net["recv"]) / dt if dt > 0 else 0
+    else:
+        up_rate = dn_rate = 0
+    
+    last_net = {"sent": net.bytes_sent, "recv": net.bytes_recv, "time": now}
+    
+    upload_history.append(up_rate)
+    download_history.append(dn_rate)
+    while len(upload_history) > MAX_HISTORY:
+        upload_history.pop(0)
+    while len(download_history) > MAX_HISTORY:
+        download_history.pop(0)
+    
+    peak_up = max(upload_history) if upload_history else 0
+    peak_dn = max(download_history) if download_history else 0
+    max_scale = max(peak_up, peak_dn, 1024*1024)
+    
+    lines = [
+        f"[red]↑ {sparkline(upload_history, 18, max_scale)} {format_bytes(up_rate):>9}/s[/]",
+        f"[green]↓ {sparkline(download_history, 18, max_scale)} {format_bytes(dn_rate):>9}/s[/]",
+        "",
+        f"[dim]Peak  ↑ {format_bytes(peak_up):>8}/s  ↓ {format_bytes(peak_dn):>8}/s[/]",
+        f"[dim]Total ↑ {format_bytes(net.bytes_sent):>8}  ↓ {format_bytes(net.bytes_recv):>8}[/]",
+        f"[dim]Scale: {format_bytes(max_scale)}/s[/]"
+    ]
+    
+    return Panel("\n".join(lines), title="Network", border_style="yellow")
+
+
+def make_feed() -> Panel:
+    messages = get_messages()
+    lines = []
+    
+    for m in messages:
+        color = "cyan" if m['role'] == 'U' else "green"
+        lines.append(f"[{color}][{m['role']}][/] {m['text'][:100]}")
+    
+    if not messages:
+        lines.append("  No recent messages")
+    
+    return Panel("\n".join(lines), title="Live Feed", border_style="red")
+
+
+def make_layout() -> Layout:
+    layout = Layout()
+    
+    layout.split_column(
+        Layout(name="top", size=14),
+        Layout(name="middle", size=12),
+        Layout(name="bottom", size=12),
+    )
+    
+    layout["top"].split_row(
+        Layout(make_overview(), name="overview"),
+        Layout(make_usage(), name="usage"),
+        Layout(make_costs(), name="costs"),
+    )
+    
+    layout["middle"].split_row(
+        Layout(make_sessions(), name="sessions"),
+        Layout(make_crons(), name="crons"),
+        Layout(make_processes(), name="processes"),
+    )
+    
+    layout["bottom"].split_row(
+        Layout(make_network(), name="network", ratio=1),
+        Layout(make_feed(), name="feed", ratio=2),
+    )
+    
+    return layout
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    app = OpenClawDashboard()
-    app.title = "OpenClaw Dashboard"
-    app.run()
+    # Handle Ctrl+C gracefully
+    def sigint_handler(sig, frame):
+        sys.exit(0)
+    signal.signal(signal.SIGINT, sigint_handler)
+    
+    console.clear()
+    
+    with Live(make_layout(), console=console, refresh_per_second=0.5, screen=True) as live:
+        while True:
+            time.sleep(FAST_INTERVAL)
+            live.update(make_layout())
 
 
 if __name__ == "__main__":
