@@ -13,7 +13,8 @@ A lightweight terminal dashboard for monitoring [OpenClaw](https://openclaw.dev)
 - 💰 **Cost Tracking** — Spending by day, model, and all-time totals
 - 📝 **Sessions** — Active sessions with model and token counts
 - ⏰ **Cron Jobs** — Scheduled task status
-- 📡 **Live Feed** — Real-time message stream
+- 📡 **Live Feed** — Real-time message stream with tool call visibility
+- 🧩 **Skills** — Available agent skills by source (workspace/bundled)
 - 🔝 **Top Processes** — CPU/memory usage by process
 - 🌐 **Network** — Upload/download with traffic sparklines
 
@@ -125,7 +126,7 @@ EOF
 ├─────────────┼─────────────┼─────────────┤
 │   Network   │    Crons    │  Processes  │
 ├─────────────┼─────────────────────────────┤
-│             │         Live Feed          │
+│   Skills    │         Live Feed          │
 ├─────────────┼─────────────────────────────┤
 │             │          Sessions          │
 └─────────────┴─────────────────────────────┘
