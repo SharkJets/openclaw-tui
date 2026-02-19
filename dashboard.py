@@ -457,13 +457,45 @@ def get_messages():
                         continue
                     
                     content = msg.get('content', '')
+                    text = ''
                     if isinstance(content, list):
-                        content = next((b.get('text', '') for b in content if b.get('type') == 'text'), '')
+                        # Look for text block first
+                        text = next((b.get('text', '') for b in content if b.get('type') == 'text'), '')
+                        # If no text, summarize tool calls
+                        if not text:
+                            tools = [b for b in content if b.get('type') == 'toolCall']
+                            if tools:
+                                summaries = []
+                                for t in tools[:2]:  # Max 2 tools shown
+                                    name = t.get('name', '?')
+                                    args = t.get('arguments', {})
+                                    if name == 'exec':
+                                        cmd = args.get('command', '')[:60]
+                                        summaries.append(f"exec: {cmd}")
+                                    elif name in ('read', 'Read'):
+                                        path = args.get('file_path', args.get('path', ''))
+                                        summaries.append(f"read: {path.split('/')[-1]}")
+                                    elif name in ('write', 'Write'):
+                                        path = args.get('file_path', args.get('path', ''))
+                                        summaries.append(f"write: {path.split('/')[-1]}")
+                                    elif name in ('edit', 'Edit'):
+                                        path = args.get('file_path', args.get('path', ''))
+                                        summaries.append(f"edit: {path.split('/')[-1]}")
+                                    else:
+                                        summaries.append(name)
+                                text = '🔧 ' + ' | '.join(summaries)
+                                if len(tools) > 2:
+                                    text += f' +{len(tools)-2}'
+                    else:
+                        text = str(content)
+                    
+                    if not text:
+                        continue  # Skip empty entries
                     
                     messages.append({
                         'ts': ts_ms,
                         'role': role[0].upper(),
-                        'text': str(content).replace('\n', ' ')[:120]
+                        'text': text.replace('\n', ' ')[:120]
                     })
                 except:
                     continue
